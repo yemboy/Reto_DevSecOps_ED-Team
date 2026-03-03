@@ -1,0 +1,489 @@
+name: Provision Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud_provider:
+        description: 'Cloud provider'
+        required: true
+        default: 'azure'
+        type: choice
+        options:
+        - azure
+        - aws
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+        - create
+        - destroy
+
+env:
+  # Azure
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  AKS_NAME: ${{ vars.AKS_NAME }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+  # AWS
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  ECR_REPOSITORY_NAME: ${{ vars.ECR_REPOSITORY_NAME }}
+
+jobs:
+  # ==============================
+  # AZURE - Create Infrastructure
+  # ==============================
+  azure-create:
+    name: Azure - Create Infrastructure
+    if: ${{ inputs.cloud_provider == 'azure' && inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create Azure Infrastructure
+      run: |
+        echo "=== CREATING AZURE INFRASTRUCTURE ==="
+        echo ""
+
+        ACR_NAME="acredteamdevsecops"
+        echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+
+        echo "Resources to create:"
+        echo "- Resource Group: ${{ env.RESOURCE_GROUP }} (using existing)"
+        echo "- AKS Cluster: ${{ env.AKS_NAME }}"
+        echo "- ACR Registry: $ACR_NAME"
+        echo "- Location: ${{ env.AZURE_LOCATION }}"
+        echo ""
+
+        # 1. Verify Resource Group exists
+        echo "📦 Verifying Resource Group exists..."
+        if az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          echo "✅ Resource Group exists: ${{ env.RESOURCE_GROUP }}"
+          RG_LOCATION=$(az group show --name ${{ env.RESOURCE_GROUP }} --query location -o tsv)
+          echo "📍 Resource Group location: $RG_LOCATION"
+        else
+          echo "❌ Resource Group not found: ${{ env.RESOURCE_GROUP }}"
+          echo ""
+          echo "🔍 Available Resource Groups:"
+          az group list --query "[].{Name:name, Location:location}" -o table
+          echo ""
+          echo "💡 Please update the RESOURCE_GROUP variable with an existing RG name"
+          exit 1
+        fi
+
+        # 2. Create Azure Container Registry
+        echo "🐳 Creating Azure Container Registry..."
+        if az acr show --name $ACR_NAME > /dev/null 2>&1; then
+          echo "⚠️ ACR already exists: $ACR_NAME"
+        else
+          az acr create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name $ACR_NAME \
+            --sku Basic \
+            --admin-enabled true
+          echo "✅ ACR created: $ACR_NAME"
+        fi
+
+        # 3. Create AKS Cluster
+        echo "☸️ Creating AKS Cluster..."
+        if az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} > /dev/null 2>&1; then
+          echo "⚠️ AKS cluster already exists: ${{ env.AKS_NAME }}"
+        else
+          az aks create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AKS_NAME }} \
+            --node-count 1 \
+            --node-vm-size Standard_D2s_v3 \
+            --generate-ssh-keys \
+            --enable-managed-identity
+          echo "✅ AKS Cluster created"
+        fi
+
+        # 4. Get AKS credentials
+        echo "🔑 Getting AKS credentials..."
+        az aks get-credentials \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AKS_NAME }} \
+          --overwrite-existing
+
+        # 5. Configure ACR access via K8s secret
+        echo "🔗 Configuring ACR access..."
+        ACR_SERVER=$(az acr show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query loginServer -o tsv)
+        ACR_USERNAME=$(az acr credential show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query username -o tsv)
+        ACR_PASSWORD=$(az acr credential show --name $ACR_NAME --resource-group ${{ env.RESOURCE_GROUP }} --query passwords[0].value -o tsv)
+
+        kubectl create secret docker-registry registry-secret \
+          --docker-server=$ACR_SERVER \
+          --docker-username=$ACR_USERNAME \
+          --docker-password=$ACR_PASSWORD \
+          --docker-email=noreply@example.com \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "✅ ACR access configured via Kubernetes secret"
+
+        # 6. Install Traefik Ingress Controller via Helm
+        echo "🌐 Installing Traefik Ingress Controller..."
+        if kubectl get namespace traefik > /dev/null 2>&1; then
+          echo "✅ Traefik Ingress Controller already installed"
+        else
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm repo add traefik https://traefik.github.io/charts
+          helm repo update
+          helm install traefik traefik/traefik \
+            --namespace traefik \
+            --create-namespace \
+            --set service.type=LoadBalancer
+
+          echo "⏳ Waiting for Traefik Ingress Controller..."
+          kubectl wait --namespace traefik \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/name=traefik \
+            --timeout=300s
+        fi
+
+        echo ""
+        echo "=== AZURE INFRASTRUCTURE CREATED SUCCESSFULLY ==="
+
+    - name: Verify Azure Infrastructure
+      run: |
+        echo "🔍 === VERIFYING AZURE INFRASTRUCTURE ==="
+        echo ""
+        echo "🐳 Azure Container Registry:"
+        az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[].{Name:name, LoginServer:loginServer}" -o table
+        echo ""
+        echo "☸️ AKS Cluster:"
+        az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} --query "{Name:name, Status:provisioningState, KubernetesVersion:kubernetesVersion}" -o table
+        echo ""
+        echo "🔗 Kubernetes nodes:"
+        kubectl get nodes
+        echo ""
+        echo "🌐 Traefik Ingress Controller:"
+        kubectl get pods -n traefik -l app.kubernetes.io/name=traefik
+        echo ""
+        echo "🔗 Ingress Controller Service:"
+        kubectl get service -n traefik traefik
+        echo ""
+        echo "✅ All Azure components verified!"
+
+    - name: Generate Azure Summary
+      run: |
+        ACR_LOGIN_SERVER=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[0].loginServer" -o tsv)
+        ACR_NAME_ONLY=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[0].name" -o tsv)
+
+        echo "## 🎉 Azure Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Resources:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: Azure" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: \`${{ env.RESOURCE_GROUP }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **AKS Cluster**: \`${{ env.AKS_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **ACR Registry**: \`$ACR_LOGIN_SERVER\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Location**: ${{ env.AZURE_LOCATION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔧 Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Set variable \`CLOUD_PROVIDER\` = \`azure\`" >> $GITHUB_STEP_SUMMARY
+        echo "2. Set variable \`REGISTRY_NAME\` = \`$ACR_NAME_ONLY\`" >> $GITHUB_STEP_SUMMARY
+        echo "3. Push code to main to trigger deployment" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 💡 Commands:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get service -n traefik traefik" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ===============================
+  # AZURE - Destroy Infrastructure
+  # ===============================
+  azure-destroy:
+    name: Azure - Destroy Infrastructure
+    if: ${{ inputs.cloud_provider == 'azure' && inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Destroy Azure Infrastructure
+      run: |
+        echo "=== DESTROYING AZURE INFRASTRUCTURE ==="
+        echo ""
+        echo "⚠️ This will delete AKS and ACR from: ${{ env.RESOURCE_GROUP }}"
+        echo "📦 Resource Group will NOT be deleted"
+        echo ""
+
+        if az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          # Delete AKS
+          if az aks show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} > /dev/null 2>&1; then
+            echo "🗑️ Deleting AKS Cluster: ${{ env.AKS_NAME }}..."
+            az aks delete --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_NAME }} --yes --no-wait
+            echo "✅ AKS deletion initiated"
+          else
+            echo "- AKS Cluster: Not found"
+          fi
+
+          # Delete ACR
+          ACR_LIST=$(az acr list --resource-group ${{ env.RESOURCE_GROUP }} --query "[].name" -o tsv)
+          if [ ! -z "$ACR_LIST" ]; then
+            for ACR_NAME in $ACR_LIST; do
+              if [[ $ACR_NAME == acredteamdevsecops* ]]; then
+                echo "🗑️ Deleting ACR: $ACR_NAME..."
+                az acr delete --resource-group ${{ env.RESOURCE_GROUP }} --name $ACR_NAME --yes
+                echo "✅ ACR deleted: $ACR_NAME"
+              fi
+            done
+          else
+            echo "- ACR Registry: Not found"
+          fi
+
+          echo ""
+          echo "✅ Azure cleanup completed"
+          echo "📦 Resource Group '${{ env.RESOURCE_GROUP }}' preserved"
+        else
+          echo "❌ Resource Group doesn't exist: ${{ env.RESOURCE_GROUP }}"
+        fi
+
+    - name: Generate Azure Cleanup Summary
+      run: |
+        echo "## 🗑️ Azure Infrastructure Cleanup" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: Azure" >> $GITHUB_STEP_SUMMARY
+        echo "- **AKS Cluster**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **ACR Registry**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: ✅ Preserved" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================
+  # AWS - Create Infrastructure
+  # ===========================
+  aws-create:
+    name: AWS - Create Infrastructure
+    if: ${{ inputs.cloud_provider == 'aws' && inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Create AWS Infrastructure
+      run: |
+        echo "=== CREATING AWS INFRASTRUCTURE ==="
+        echo ""
+        echo "Resources to create:"
+        echo "- ECR Repository: ${{ env.ECR_REPOSITORY_NAME }}"
+        echo "- EKS Cluster: ${{ env.EKS_CLUSTER_NAME }}"
+        echo "- Region: ${{ env.AWS_REGION }}"
+        echo ""
+
+        # 1. Create ECR Repository
+        echo "🐳 Creating ECR Repository..."
+        if aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "⚠️ ECR repository already exists: ${{ env.ECR_REPOSITORY_NAME }}"
+        else
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY_NAME }} \
+            --image-scanning-configuration scanOnPush=true \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ ECR repository created: ${{ env.ECR_REPOSITORY_NAME }}"
+        fi
+
+        ECR_URI=$(aws ecr describe-repositories \
+          --repository-names ${{ env.ECR_REPOSITORY_NAME }} \
+          --query 'repositories[0].repositoryUri' --output text)
+        echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+
+        # 2. Install eksctl
+        echo "📦 Installing eksctl..."
+        curl --silent --location \
+          "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+          | tar xz -C /tmp
+        sudo mv /tmp/eksctl /usr/local/bin
+        eksctl version
+
+        # 3. Create EKS Cluster
+        echo "☸️ Creating EKS Cluster (this may take 15-20 minutes)..."
+        if eksctl get cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "⚠️ EKS cluster already exists: ${{ env.EKS_CLUSTER_NAME }}"
+        else
+          eksctl create cluster \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --node-type t3.medium \
+            --nodes 1 \
+            --managed
+          echo "✅ EKS Cluster created"
+        fi
+
+        # 4. Update kubeconfig
+        echo "🔑 Updating kubeconfig..."
+        aws eks update-kubeconfig \
+          --name ${{ env.EKS_CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }}
+
+        # 5. Configure ECR access via K8s secret
+        echo "🔗 Configuring ECR access..."
+        ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_SERVER="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+
+        kubectl create secret docker-registry registry-secret \
+          --docker-server=$ECR_SERVER \
+          --docker-username=AWS \
+          --docker-password=$ECR_PASSWORD \
+          --docker-email=noreply@example.com \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "✅ ECR access configured via Kubernetes secret"
+
+        # 6. Install Traefik Ingress Controller via Helm
+        echo "🌐 Installing Traefik Ingress Controller..."
+        if kubectl get namespace traefik > /dev/null 2>&1; then
+          echo "✅ Traefik Ingress Controller already installed"
+        else
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm repo add traefik https://traefik.github.io/charts
+          helm repo update
+          helm install traefik traefik/traefik \
+            --namespace traefik \
+            --create-namespace \
+            --set service.type=LoadBalancer
+
+          echo "⏳ Waiting for Traefik Ingress Controller..."
+          kubectl wait --namespace traefik \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/name=traefik \
+            --timeout=300s
+        fi
+
+        echo ""
+        echo "=== AWS INFRASTRUCTURE CREATED SUCCESSFULLY ==="
+
+    - name: Verify AWS Infrastructure
+      run: |
+        echo "🔍 === VERIFYING AWS INFRASTRUCTURE ==="
+        echo ""
+        echo "🐳 ECR Repository:"
+        aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --output table
+        echo ""
+        echo "☸️ EKS Cluster:"
+        aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --query "cluster.{Name:name, Status:status, Version:version}" --output table
+        echo ""
+        echo "🔗 Kubernetes nodes:"
+        kubectl get nodes
+        echo ""
+        echo "🌐 Traefik Ingress Controller:"
+        kubectl get pods -n traefik -l app.kubernetes.io/name=traefik
+        echo ""
+        echo "🔗 Ingress Controller Service:"
+        kubectl get service -n traefik traefik
+        echo ""
+        echo "✅ All AWS components verified!"
+
+    - name: Generate AWS Summary
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_NAME }}"
+
+        echo "## 🎉 AWS Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Resources:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: AWS" >> $GITHUB_STEP_SUMMARY
+        echo "- **EKS Cluster**: \`${{ env.EKS_CLUSTER_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECR Repository**: \`$ECR_URI\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔧 Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Set variable \`CLOUD_PROVIDER\` = \`aws\`" >> $GITHUB_STEP_SUMMARY
+        echo "2. Push code to main to trigger deployment" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 💡 Commands:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get service -n traefik traefik" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================
+  # AWS - Destroy Infrastructure
+  # ============================
+  aws-destroy:
+    name: AWS - Destroy Infrastructure
+    if: ${{ inputs.cloud_provider == 'aws' && inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Destroy AWS Infrastructure
+      run: |
+        echo "=== DESTROYING AWS INFRASTRUCTURE ==="
+        echo ""
+        echo "⚠️ This will delete EKS and ECR resources"
+        echo ""
+
+        # Install eksctl
+        echo "📦 Installing eksctl..."
+        curl --silent --location \
+          "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+          | tar xz -C /tmp
+        sudo mv /tmp/eksctl /usr/local/bin
+
+        # Delete EKS Cluster
+        if eksctl get cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "🗑️ Deleting EKS Cluster: ${{ env.EKS_CLUSTER_NAME }}..."
+          eksctl delete cluster \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --wait
+          echo "✅ EKS cluster deleted"
+        else
+          echo "- EKS Cluster: Not found"
+        fi
+
+        # Delete ECR Repository
+        if aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "🗑️ Deleting ECR Repository: ${{ env.ECR_REPOSITORY_NAME }}..."
+          aws ecr delete-repository \
+            --repository-name ${{ env.ECR_REPOSITORY_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --force
+          echo "✅ ECR repository deleted"
+        else
+          echo "- ECR Repository: Not found"
+        fi
+
+        echo ""
+        echo "✅ AWS cleanup completed"
+
+    - name: Generate AWS Cleanup Summary
+      run: |
+        echo "## 🗑️ AWS Infrastructure Cleanup" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: AWS" >> $GITHUB_STEP_SUMMARY
+        echo "- **EKS Cluster**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECR Repository**: 🗑️ Deleted" >> $GITHUB_STEP_SUMMARY

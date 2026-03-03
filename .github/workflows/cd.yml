@@ -1,0 +1,369 @@
+name: CD
+
+on:
+  push:
+    paths-ignore:
+      - '.github/**'
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+env:
+  CLOUD_PROVIDER: ${{ vars.CLOUD_PROVIDER }}
+  # Azure
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  AKS_NAME: ${{ vars.AKS_NAME }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  REGISTRY_NAME: ${{ vars.REGISTRY_NAME }}
+  # AWS
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  ECR_REPOSITORY_NAME: ${{ vars.ECR_REPOSITORY_NAME }}
+
+jobs:
+  buildImage:
+    name: Build Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.image_info.outputs.image-tag }}
+      sha-short: ${{ steps.sha_short.outputs.sha_short }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: pip install -r src/requirements.txt
+
+    - name: Set SHA Short
+      id: sha_short
+      run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+    # --- Azure Build ---
+    - name: Azure Login
+      if: env.CLOUD_PROVIDER == 'azure'
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Build and push to ACR
+      if: env.CLOUD_PROVIDER == 'azure'
+      run: |
+        az acr login --name ${{ env.REGISTRY_NAME }}
+
+        IMAGE_TAG="${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.CONTAINER_NAME }}:${{ steps.sha_short.outputs.sha_short }}"
+
+        if [ ! -f "src/Dockerfile" ]; then
+          echo "❌ Dockerfile not found in src/"
+          ls -la src/
+          exit 1
+        fi
+
+        docker build -f src/Dockerfile -t $IMAGE_TAG src/
+        docker push $IMAGE_TAG
+        echo "✅ Image built and pushed: $IMAGE_TAG"
+
+    # --- AWS Build ---
+    - name: Configure AWS Credentials
+      if: env.CLOUD_PROVIDER == 'aws'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to ECR
+      if: env.CLOUD_PROVIDER == 'aws'
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push to ECR
+      if: env.CLOUD_PROVIDER == 'aws'
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+        IMAGE_TAG="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY_NAME }}:${{ steps.sha_short.outputs.sha_short }}"
+
+        if [ ! -f "src/Dockerfile" ]; then
+          echo "❌ Dockerfile not found in src/"
+          ls -la src/
+          exit 1
+        fi
+
+        docker build -f src/Dockerfile -t $IMAGE_TAG src/
+        docker push $IMAGE_TAG
+        echo "✅ Image built and pushed: $IMAGE_TAG"
+
+    # --- Unified output ---
+    - name: Set image info outputs
+      id: image_info
+      run: |
+        if [ "${{ env.CLOUD_PROVIDER }}" == "azure" ]; then
+          echo "image-tag=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.CONTAINER_NAME }}:${{ steps.sha_short.outputs.sha_short }}" >> $GITHUB_OUTPUT
+        else
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "image-tag=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY_NAME }}:${{ steps.sha_short.outputs.sha_short }}" >> $GITHUB_OUTPUT
+        fi
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: buildImage
+    outputs:
+      release-tag: ${{ steps.create_release.outputs.tag_name }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate release tag
+      id: tag_version
+      run: |
+        TAG="v$(date +'%Y%m%d')-${{ needs.buildImage.outputs.sha-short }}"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "Generated release tag: $TAG"
+
+    - name: Create GitHub Release
+      id: create_release
+      uses: actions/create-release@v1.1.4
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag_version.outputs.tag }}
+        release_name: "Release ${{ steps.tag_version.outputs.tag }}"
+        body: |
+          ## 🚀 Reto DevSecOps Deployment
+
+          ### 📋 Build Information:
+          - **Image**: `${{ needs.buildImage.outputs.image-tag }}`
+          - **Commit**: ${{ github.sha }}
+          - **Short SHA**: ${{ needs.buildImage.outputs.sha-short }}
+          - **Author**: ${{ github.actor }}
+          - **Cloud Provider**: ${{ env.CLOUD_PROVIDER }}
+
+          ### 🔗 Links:
+          - [Commit Details](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          - [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        draft: false
+        prerelease: false
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: [buildImage, release]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # --- Azure Auth ---
+    - name: Azure Login
+      if: env.CLOUD_PROVIDER == 'azure'
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set AKS context
+      if: env.CLOUD_PROVIDER == 'azure'
+      uses: azure/aks-set-context@v3
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}
+        cluster-name: ${{ env.AKS_NAME }}
+        admin: "false"
+
+    - name: Configure Azure registry secret
+      if: env.CLOUD_PROVIDER == 'azure'
+      run: |
+        echo "🔍 Configuring registry secret..."
+        if kubectl get secret registry-secret > /dev/null 2>&1; then
+          echo "✅ Registry secret exists"
+        else
+          echo "🔧 Creating registry secret..."
+          ACR_USERNAME=$(az acr credential show --name ${{ env.REGISTRY_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name ${{ env.REGISTRY_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query passwords[0].value -o tsv)
+          kubectl create secret docker-registry registry-secret \
+            --docker-server=${{ env.REGISTRY_NAME }}.azurecr.io \
+            --docker-username=$ACR_USERNAME \
+            --docker-password=$ACR_PASSWORD \
+            --docker-email=noreply@example.com
+          echo "✅ Registry secret created"
+        fi
+
+    # --- AWS Auth ---
+    - name: Configure AWS Credentials
+      if: env.CLOUD_PROVIDER == 'aws'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Set EKS context
+      if: env.CLOUD_PROVIDER == 'aws'
+      run: |
+        aws eks update-kubeconfig \
+          --name ${{ env.EKS_CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Configure AWS registry secret
+      if: env.CLOUD_PROVIDER == 'aws'
+      run: |
+        echo "🔍 Configuring registry secret..."
+        ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_SERVER="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+
+        kubectl create secret docker-registry registry-secret \
+          --docker-server=$ECR_SERVER \
+          --docker-username=AWS \
+          --docker-password=$ECR_PASSWORD \
+          --docker-email=noreply@example.com \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "✅ Registry secret configured"
+
+    # --- Common deploy steps ---
+    - name: Install yq
+      run: sudo snap install yq || sudo apt-get install -y yq || true
+
+    - name: Update image in manifests
+      run: |
+        yq eval '.spec.template.spec.containers[0].image = "${{ needs.buildImage.outputs.image-tag }}"' -i k8s/deployment.yml
+        echo "📋 Manifest updated with image: ${{ needs.buildImage.outputs.image-tag }}"
+
+    - name: Debug deployment manifest
+      run: |
+        echo "📄 Modified deployment.yml:"
+        cat k8s/deployment.yml
+
+    - name: Deploy to Kubernetes
+      run: |
+        echo "Deploying to cluster..."
+        kubectl apply -f k8s/
+        kubectl rollout status deployment/ed-team-app --timeout=600s
+        echo "✅ Deployment completed!"
+
+    - name: Verify deployment
+      run: |
+        echo "=== DEPLOYMENT VERIFICATION ==="
+        echo ""
+        echo "📦 Pods:"
+        kubectl get pods -l app=ed-team-app -o wide
+        echo ""
+        echo "🔗 Services:"
+        kubectl get services
+        echo ""
+        echo "🌐 Ingress:"
+        kubectl get ingress
+        echo ""
+        echo "📈 HPA:"
+        kubectl get hpa
+        echo ""
+        echo "🚀 Deployment details:"
+        kubectl describe deployment ed-team-app
+
+  validate:
+    name: Post-Deploy Validation
+    runs-on: ubuntu-latest
+    needs: [buildImage, release, deploy]
+
+    steps:
+    # --- Azure Auth ---
+    - name: Azure Login
+      if: env.CLOUD_PROVIDER == 'azure'
+      uses: Azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set AKS context
+      if: env.CLOUD_PROVIDER == 'azure'
+      uses: azure/aks-set-context@v3
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}
+        cluster-name: ${{ env.AKS_NAME }}
+
+    # --- AWS Auth ---
+    - name: Configure AWS Credentials
+      if: env.CLOUD_PROVIDER == 'aws'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Set EKS context
+      if: env.CLOUD_PROVIDER == 'aws'
+      run: |
+        aws eks update-kubeconfig \
+          --name ${{ env.EKS_CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }}
+
+    # --- Common validation ---
+    - name: Application health test
+      run: |
+        echo "🧪 Testing application health..."
+
+        kubectl wait --for=condition=ready pod -l app=ed-team-app --timeout=300s
+
+        kubectl port-forward service/ed-team-app-service 8080:80 &
+        PF_PID=$!
+        sleep 15
+
+        HEALTH_RESPONSE=$(curl -s http://localhost:8080/health || echo "FAILED")
+        APP_RESPONSE=$(curl -s http://localhost:8080/ || echo "FAILED")
+
+        kill $PF_PID
+
+        if [[ $HEALTH_RESPONSE == *"healthy"* ]]; then
+          echo "✅ Health check passed: $HEALTH_RESPONSE"
+        else
+          echo "❌ Health check failed: $HEALTH_RESPONSE"
+          exit 1
+        fi
+
+    - name: Get external access info
+      run: |
+        echo "🌐 === EXTERNAL ACCESS INFO ==="
+
+        # Try IP first (Azure), then hostname (AWS ELB)
+        EXTERNAL_ADDR=$(kubectl get service -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        if [ -z "$EXTERNAL_ADDR" ]; then
+          EXTERNAL_ADDR=$(kubectl get service -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+        fi
+
+        if [ "$EXTERNAL_ADDR" != "pending" ] && [ ! -z "$EXTERNAL_ADDR" ]; then
+          echo "🔗 Application URL: http://$EXTERNAL_ADDR/"
+          echo "🏥 Health Check URL: http://$EXTERNAL_ADDR/health"
+          echo "📱 Ready for Postman testing!"
+        else
+          echo "⏳ External address still pending..."
+          kubectl get service -n traefik traefik
+        fi
+
+    - name: Deployment summary
+      run: |
+        echo "## 🎉 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Successfully Deployed:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cloud Provider**: ${{ env.CLOUD_PROVIDER }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release**: ${{ needs.release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: \`${{ needs.buildImage.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔍 Validation Results:" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Pods are running and ready" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Health check endpoint responds correctly" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Application returns 'Hola ED Team'" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 Testing:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Get external address: \`kubectl get service -n traefik traefik\`" >> $GITHUB_STEP_SUMMARY
+        echo "2. Test with Postman: \`GET http://[EXTERNAL-ADDR]/\`" >> $GITHUB_STEP_SUMMARY
+        echo "3. Expected response: \`{\"message\": \"Hola ED Team\"}\`" >> $GITHUB_STEP_SUMMARY
