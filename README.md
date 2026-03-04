@@ -1,40 +1,57 @@
 # Reto DevSecOps - ED Team
 
-API simple en Flask con pipeline DevSecOps completo, despliegue automatizado en Kubernetes (Azure AKS o AWS EKS) y escaneo de seguridad integrado.
+APIs en Flask (Python) y Go con pipeline DevSecOps completo, despliegue automatizado en Kubernetes (Azure AKS o AWS EKS) y escaneo de seguridad integrado.
 
 ## ¿Qué hace?
 
-Una API Flask con dos endpoints:
+Dos APIs con los mismos endpoints:
 
 | Endpoint | Respuesta |
 |----------|-----------|
 | `GET /` | `{"message": "Hola ED Team"}` |
 | `GET /health` | `{"status": "healthy"}` |
 
+| App | Lenguaje | Puerto | Directorio |
+|-----|----------|--------|------------|
+| Python (Flask) | Python 3.13 | 5000 | `src/` |
+| Go | Go 1.23 | 8080 | `src-go/` |
+
 ## Estructura del proyecto
 
 ```
 src/
-  app.py              # Aplicación Flask
+  app.py              # Aplicación Flask (Python)
   Dockerfile          # Imagen Docker (Python 3.13 + Gunicorn)
   requirements.txt    # Dependencias (Flask, Gunicorn)
+src-go/
+  main.go             # Aplicación Go
+  main_test.go        # Tests unitarios
+  go.mod              # Módulo Go
+  Dockerfile          # Imagen Docker (Go 1.23, multi-stage)
 k8s/
   deployment.yml      # Deployment con 2 réplicas, probes y security context
   service.yml         # Service ClusterIP (puerto 80 → 5000)
   ingress.yml         # Ingress con Traefik
   hpa.yml             # Autoescalado (2-10 pods, CPU 70% / RAM 80%)
 .github/workflows/
-  ci.yml              # Pipeline CI (SAST, SCA, escaneo de imagen)
+  ci.yml              # Pipeline CI Python (SAST, SCA, escaneo de imagen)
+  ci-go.yml           # Pipeline CI Go (tests, SAST, SCA, escaneo de imagen)
   cd.yml              # Pipeline CD (build, release, deploy)
   infraestructure.yml # Provisión de infraestructura (AKS/EKS)
 ```
 
 ## Pipelines
 
-### CI (`ci.yml`) — Se ejecuta en push/PR a `main` (cambios en `src/`)
-1. **SAST** — Análisis estático con CodeQL
+### CI Python (`ci.yml`) — Se ejecuta en push/PR a `main` (cambios en `src/`)
+1. **SAST** — Análisis estático con CodeQL (Python)
 2. **SCA** — Revisión de dependencias (solo en PRs)
 3. **Container Security** — Escaneo de imagen con Grype/Anchore
+
+### CI Go (`ci-go.yml`) — Se ejecuta en push/PR a `main` (cambios en `src-go/`)
+1. **Test** — Tests unitarios con `go test -race`
+2. **SAST** — Análisis estático con CodeQL (Go)
+3. **SCA** — Revisión de dependencias (solo en PRs)
+4. **Container Security** — Escaneo de imagen con Grype/Anchore
 
 ### CD (`cd.yml`) — Se ejecuta en push a `main`
 1. **Build** — Construye la imagen Docker y la sube al registry (ACR o ECR)
@@ -93,6 +110,7 @@ Configura todo en **GitHub → Settings → Secrets and variables → Actions**.
 |-------------|-------|---------|
 | Python 3.x | `brew install python` | [python.org/downloads](https://www.python.org/downloads/) (marcar "Add to PATH") |
 | pip | Incluido con Python | Incluido con Python |
+| Go 1.23+ | `brew install go` | [go.dev/dl](https://go.dev/dl/) |
 | Docker | [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/) | [Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/) |
 | Git | `brew install git` | [git-scm.com](https://git-scm.com/download/win) |
 
@@ -119,12 +137,34 @@ python app.py
 > py app.py
 > ```
 
+### Con Go
+
+```bash
+cd src-go
+go run main.go
+# Disponible en http://localhost:8080
+```
+
+Tests:
+```bash
+cd src-go
+go test -v ./...
+```
+
 ### Con Docker (multiplataforma)
 
 Funciona igual en macOS, Windows y Linux (requiere Docker Desktop):
 
+**Python:**
 ```bash
 docker build -t ed-team-app src/
 docker run -p 5000:5000 ed-team-app
 # Disponible en http://localhost:5000
+```
+
+**Go:**
+```bash
+docker build -t ed-team-app-go src-go/
+docker run -p 8080:8080 ed-team-app-go
+# Disponible en http://localhost:8080
 ```

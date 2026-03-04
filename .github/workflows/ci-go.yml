@@ -1,0 +1,105 @@
+name: CI - Go
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src-go/**'
+    branches: [ main ]
+
+  pull_request:
+    paths:
+      - 'src-go/**'
+    branches: [ main ]
+
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+  packages: read
+  pull-requests: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: src-go/go.mod
+
+      - name: Run tests
+        working-directory: src-go
+        run: go test -v -race ./...
+
+  SAST:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: true
+
+  SCA:
+    name: SCA - Go dependencies
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: true
+          vulnerability-check: true
+
+  Container_security:
+    name: Dockerfile Scan - Go
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f src-go/Dockerfile -t test-image-go src-go/
+
+      - name: Image Scan
+        uses: anchore/scan-action@v6
+        id: scan
+        with:
+          image: test-image-go
+          fail-build: false
+          severity-cutoff: high
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
