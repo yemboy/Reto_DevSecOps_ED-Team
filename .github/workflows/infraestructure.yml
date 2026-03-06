@@ -327,6 +327,10 @@ jobs:
 
         if [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
           echo "🗑️ Deleting failed stack (status: $STACK_STATUS)..."
+          aws cloudformation update-termination-protection \
+            --no-enable-termination-protection \
+            --stack-name "eksctl-${{ env.EKS_CLUSTER_NAME }}-cluster" \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
           aws cloudformation delete-stack \
             --stack-name "eksctl-${{ env.EKS_CLUSTER_NAME }}-cluster" \
             --region ${{ env.AWS_REGION }}
@@ -499,6 +503,10 @@ jobs:
 
           if [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
             echo "🗑️ Deleting failed stack: $STACK_NAME (status: $STACK_STATUS)..."
+            aws cloudformation update-termination-protection \
+              --no-enable-termination-protection \
+              --stack-name "$STACK_NAME" \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
             aws cloudformation delete-stack --stack-name "$STACK_NAME" --region ${{ env.AWS_REGION }}
             aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region ${{ env.AWS_REGION }}
             echo "✅ Failed stack cleaned up: $STACK_NAME"
