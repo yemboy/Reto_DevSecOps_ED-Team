@@ -318,7 +318,25 @@ jobs:
         sudo mv /tmp/eksctl /usr/local/bin
         eksctl version
 
-        # 3. Create EKS Cluster (using lab pre-existing IAM roles)
+        # 3. Cleanup any failed CloudFormation stacks
+        echo "🧹 Checking for leftover CloudFormation stacks..."
+        STACK_STATUS=$(aws cloudformation describe-stacks \
+          --stack-name "eksctl-${{ env.EKS_CLUSTER_NAME }}-cluster" \
+          --region ${{ env.AWS_REGION }} \
+          --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+        if [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
+          echo "🗑️ Deleting failed stack (status: $STACK_STATUS)..."
+          aws cloudformation delete-stack \
+            --stack-name "eksctl-${{ env.EKS_CLUSTER_NAME }}-cluster" \
+            --region ${{ env.AWS_REGION }}
+          aws cloudformation wait stack-delete-complete \
+            --stack-name "eksctl-${{ env.EKS_CLUSTER_NAME }}-cluster" \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ Failed stack cleaned up"
+        fi
+
+        # 4. Create EKS Cluster (using lab pre-existing IAM roles)
         echo "☸️ Creating EKS Cluster (this may take 15-20 minutes)..."
         if eksctl get cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
           echo "⚠️ EKS cluster already exists: ${{ env.EKS_CLUSTER_NAME }}"
