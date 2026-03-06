@@ -488,6 +488,23 @@ jobs:
           | tar xz -C /tmp
         sudo mv /tmp/eksctl /usr/local/bin
 
+        # Cleanup any failed CloudFormation stacks
+        echo "🧹 Checking for leftover CloudFormation stacks..."
+        for STACK_SUFFIX in "cluster" "nodegroup-ng-edteam"; do
+          STACK_NAME="eksctl-${{ env.EKS_CLUSTER_NAME }}-${STACK_SUFFIX}"
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
+            echo "🗑️ Deleting failed stack: $STACK_NAME (status: $STACK_STATUS)..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME" --region ${{ env.AWS_REGION }}
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region ${{ env.AWS_REGION }}
+            echo "✅ Failed stack cleaned up: $STACK_NAME"
+          fi
+        done
+
         # Delete EKS Cluster
         if eksctl get cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
           echo "🗑️ Deleting EKS Cluster: ${{ env.EKS_CLUSTER_NAME }}..."
