@@ -1,0 +1,8 @@
+{
+  "CLOUD_PROVIDER": "azure",
+  "RESOURCE_GROUP": "rg-edteam-devsecops",
+  "AKS_NAME": "aks-edteam-cluster",
+  "CONTAINER_NAME": "ed-team-app",
+  "REGISTRY_NAME": "acredteamdevsecops",
+  "AZURE_LOCATION": "eastus"
+}

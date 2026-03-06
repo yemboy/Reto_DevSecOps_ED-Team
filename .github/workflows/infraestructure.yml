@@ -318,17 +318,34 @@ jobs:
         sudo mv /tmp/eksctl /usr/local/bin
         eksctl version
 
-        # 3. Create EKS Cluster
+        # 3. Create EKS Cluster (using lab pre-existing IAM roles)
         echo "☸️ Creating EKS Cluster (this may take 15-20 minutes)..."
         if eksctl get cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
           echo "⚠️ EKS cluster already exists: ${{ env.EKS_CLUSTER_NAME }}"
         else
-          eksctl create cluster \
-            --name ${{ env.EKS_CLUSTER_NAME }} \
-            --region ${{ env.AWS_REGION }} \
-            --node-type t3.medium \
-            --nodes 1 \
-            --managed
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          cat > /tmp/cluster-config.yaml <<EOF
+        apiVersion: eksctl.io/v1alpha5
+        kind: ClusterConfig
+        metadata:
+          name: ${{ env.EKS_CLUSTER_NAME }}
+          region: ${{ env.AWS_REGION }}
+        iam:
+          serviceRoleARN: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/eksClusterRole"
+        managedNodeGroups:
+          - name: ng-edteam
+            instanceType: t3.small
+            desiredCapacity: 1
+            minSize: 1
+            maxSize: 2
+            iam:
+              instanceRoleARN: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/AmazonEKSNodeRole"
+        EOF
+
+          echo "📋 Cluster config:"
+          cat /tmp/cluster-config.yaml
+          eksctl create cluster -f /tmp/cluster-config.yaml
           echo "✅ EKS Cluster created"
         fi
 
