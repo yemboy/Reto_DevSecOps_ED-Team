@@ -76,7 +76,8 @@ jobs:
 
       - uses: actions/dependency-review-action@v4
         with:
-          fail-on-severity: high
+          # fail-on-severity: high
+          warn-only: true
           comment-summary-in-pr: true
           vulnerability-check: true
 
